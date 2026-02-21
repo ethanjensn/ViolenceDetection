@@ -3,6 +3,7 @@ import argparse
 import cv2
 import numpy as np
 import os
+from collections import deque
 from pathlib import Path
 import torch
 import torch.nn.functional as F
@@ -17,13 +18,21 @@ VIDEO_PATH = None
 FRAME_SKIP = 1  # Process every Nth frame
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 YOLO_MODEL_PATH = str(_PROJECT_ROOT / 'MODELS' / 'yolo11m-pose.pt')
-VIOLENCE_MODEL_PATH = str(_PROJECT_ROOT / 'MODELS' / 'violence_model.pt')
+VIOLENCE_MODEL_PATH = str(_PROJECT_ROOT / 'MODELS' / 'best_violence_lstm.pt')
 
 # Global models
 detection_model = None
 violence_model = None
+violence_model_type = None
 device = None
 transform = None
+sequence_buffer = None
+
+SEQUENCE_LENGTH = 30
+K_PEOPLE = 2
+NUM_KEYPOINTS = 17
+FEATURES_PER_PERSON = NUM_KEYPOINTS * 3
+LSTM_INPUT_SIZE = K_PEOPLE * FEATURES_PER_PERSON
 
 # Alert tracking
 alert_start_time = None
@@ -104,9 +113,67 @@ class EnhancedViolenceClassifier(nn.Module):
         
         return output
 
+class PoseLSTM(nn.Module):
+    def __init__(self, input_size=LSTM_INPUT_SIZE, hidden_size=128, num_layers=2, num_classes=1):
+        super(PoseLSTM, self).__init__()
+ 
+        self.embedding = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+ 
+        self.lstm = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.2
+        )
+ 
+        self.attention = nn.Linear(hidden_size, 1)
+ 
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, num_classes)
+        )
+ 
+    def forward(self, x):
+        x = self.embedding(x)
+        lstm_out, _ = self.lstm(x)
+        attn_weights = F.softmax(self.attention(lstm_out), dim=1)
+        context = torch.sum(attn_weights * lstm_out, dim=1)
+        out = self.classifier(context)
+        return out
+
+def _safe_torch_load(path, device):
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+def _get_state_dict(checkpoint):
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        return checkpoint['model_state_dict']
+    return checkpoint
+
+def _detect_model_type(state_dict: dict) -> str:
+    if not isinstance(state_dict, dict):
+        return 'unknown'
+
+    keys = set(state_dict.keys())
+    if any(k.startswith('embedding.') for k in keys) or any(k.startswith('lstm.') for k in keys):
+        return 'lstm'
+    if any(k.startswith('pose_encoder.') for k in keys) or any(k.startswith('backbone.') for k in keys):
+        return 'enhanced'
+    return 'unknown'
+
 def load_models():
     """Load YOLO and violence detection models"""
-    global detection_model, violence_model, device, transform
+    global detection_model, violence_model, violence_model_type, device, transform, sequence_buffer
     
     print("[INFO] Loading models...")
     
@@ -120,14 +187,18 @@ def load_models():
     print(f"[INFO] YOLO pose model loaded on {device}")
     
     # Load violence detection model
-    violence_model = EnhancedViolenceClassifier(pose_feature_dim=325, use_pretrained=True).to(device)
-    checkpoint = torch.load(VIOLENCE_MODEL_PATH, map_location=device)
-    
-    # Handle different save formats
-    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        violence_model.load_state_dict(checkpoint['model_state_dict'])
+    checkpoint = _safe_torch_load(VIOLENCE_MODEL_PATH, device)
+    state_dict = _get_state_dict(checkpoint)
+    violence_model_type = _detect_model_type(state_dict)
+
+    if violence_model_type == 'lstm':
+        violence_model = PoseLSTM().to(device)
+        violence_model.load_state_dict(state_dict)
+        sequence_buffer = deque([torch.zeros(LSTM_INPUT_SIZE, dtype=torch.float32) for _ in range(SEQUENCE_LENGTH)], maxlen=SEQUENCE_LENGTH)
     else:
-        violence_model.load_state_dict(checkpoint)
+        violence_model = EnhancedViolenceClassifier(pose_feature_dim=325, use_pretrained=True).to(device)
+        violence_model.load_state_dict(state_dict)
+        sequence_buffer = None
         
     violence_model.eval()
     print(f"[INFO] Violence detection model loaded on {device}")
@@ -141,6 +212,73 @@ def load_models():
     ])
     
     print("[INFO] All models loaded successfully!")
+
+def extract_lstm_frame_features(results):
+    if not results or len(results) == 0 or results[0].keypoints is None:
+        return torch.zeros(LSTM_INPUT_SIZE, dtype=torch.float32)
+
+    r0 = results[0]
+
+    try:
+        kps = r0.keypoints.xyn
+        if kps is None:
+            return torch.zeros(LSTM_INPUT_SIZE, dtype=torch.float32)
+        kps = kps.cpu().numpy()
+    except Exception:
+        return torch.zeros(LSTM_INPUT_SIZE, dtype=torch.float32)
+
+    try:
+        kp_conf = r0.keypoints.conf.cpu().numpy()
+    except Exception:
+        kp_conf = None
+
+    try:
+        det_conf = r0.boxes.conf.cpu().numpy() if r0.boxes is not None else None
+    except Exception:
+        det_conf = None
+
+    n = len(kps)
+    if n <= 0:
+        return torch.zeros(LSTM_INPUT_SIZE, dtype=torch.float32)
+
+    if det_conf is None or len(det_conf) != n:
+        order = np.arange(n)
+    else:
+        order = np.argsort(det_conf)[::-1]
+
+    frame_features = []
+    for k in range(K_PEOPLE):
+        if k < len(order):
+            i = int(order[k])
+            xy = kps[i]
+            if xy.shape[0] < NUM_KEYPOINTS:
+                pad = np.zeros((NUM_KEYPOINTS - xy.shape[0], 2), dtype=np.float32)
+                xy = np.vstack([xy, pad])
+            else:
+                xy = xy[:NUM_KEYPOINTS]
+
+            if kp_conf is not None and i < len(kp_conf):
+                conf = kp_conf[i]
+                if conf.shape[0] < NUM_KEYPOINTS:
+                    cpad = np.zeros((NUM_KEYPOINTS - conf.shape[0],), dtype=np.float32)
+                    conf = np.concatenate([conf, cpad], axis=0)
+                else:
+                    conf = conf[:NUM_KEYPOINTS]
+            else:
+                conf = np.zeros((NUM_KEYPOINTS,), dtype=np.float32)
+
+            person = np.hstack([xy, conf.reshape(-1, 1)]).astype(np.float32).flatten().tolist()
+        else:
+            person = [0.0] * FEATURES_PER_PERSON
+        frame_features.extend(person)
+
+    if len(frame_features) != LSTM_INPUT_SIZE:
+        if len(frame_features) < LSTM_INPUT_SIZE:
+            frame_features.extend([0.0] * (LSTM_INPUT_SIZE - len(frame_features)))
+        else:
+            frame_features = frame_features[:LSTM_INPUT_SIZE]
+
+    return torch.tensor(frame_features, dtype=torch.float32)
 
 def extract_pose_features(results, image_shape):
     """Extract pose features for violence detection"""
@@ -384,9 +522,16 @@ def process_frame(frame, frame_number):
         
         # 4. Get violence prediction
         with torch.no_grad():
-            violence_pred = violence_model(pose_features, image_tensor)
-            violence_probs = torch.softmax(violence_pred, dim=1)
-            violence_score = float(violence_probs[0][1])
+            if violence_model_type == 'lstm':
+                frame_feat = extract_lstm_frame_features(results)
+                sequence_buffer.append(frame_feat)
+                seq = torch.stack(list(sequence_buffer), dim=0).unsqueeze(0).to(device)
+                violence_logit = violence_model(seq)
+                violence_score = float(torch.sigmoid(violence_logit)[0][0])
+            else:
+                violence_pred = violence_model(pose_features, image_tensor)
+                violence_probs = torch.softmax(violence_pred, dim=1)
+                violence_score = float(violence_probs[0][1])
         
         # 5. Extract detection data
         detected_poses_data = []

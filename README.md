@@ -43,6 +43,40 @@ cd TRAINING
 pip install -r requirements.txt
 ```
 
+#### Slicing Long Videos into 5-Second Chunks (FFmpeg)
+
+This repo includes a helper script to split long videos into fixed-length chunks for dataset prep:
+
+```bash
+cd TRAINING
+python slice_video_ffmpeg.py "path/to/video.mp4"
+```
+
+By default, chunks are 5 seconds and are written to:
+
+`./slices/<video_stem>/`
+
+#### Common options
+
+```bash
+# Choose output directory
+python slice_video_ffmpeg.py "path/to/video.mp4" --out-dir "path/to/output_chunks"
+
+# Change chunk size
+python slice_video_ffmpeg.py "path/to/video.mp4" --seconds 5
+
+# Overwrite existing output files
+python slice_video_ffmpeg.py "path/to/video.mp4" --overwrite
+
+# More accurate cuts (slower): re-encode instead of stream copy
+python slice_video_ffmpeg.py "path/to/video.mp4" --reencode
+
+# If ffmpeg is not on PATH
+python slice_video_ffmpeg.py "path/to/video.mp4" --ffmpeg-path "C:\\path\\to\\ffmpeg.exe"
+```
+
+Note: Without `--reencode`, FFmpeg uses stream copy (`-c copy`), which is very fast but segment boundaries may align to existing keyframes.
+
 #### Manual Installation (Alternative)
 ```bash
 pip install torch>=2.0.0 torchvision>=0.15.0 opencv-python>=4.8.0 numpy>=1.24.0 ultralytics>=8.0.0 timm>=0.9.0
