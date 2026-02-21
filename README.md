@@ -48,21 +48,36 @@ pip install -r requirements.txt
 pip install torch>=2.0.0 torchvision>=0.15.0 opencv-python>=4.8.0 numpy>=1.24.0 ultralytics>=8.0.0 timm>=0.9.0
 ```
 
-### Running Detection
-1. **Configure paths** in `CLIENT/detection_runner.py`:
-   ```python
-   VIDEO_PATH = "path/to/your/video.mp4"
-   YOLO_MODEL_PATH = "MODELS/yolo11m-pose.pt"
-   VIOLENCE_MODEL_PATH = "MODELS/violence_model.pt"
-   ```
+### Running Detection (Local Realtime)
 
-2. **Run detection**:
+1. **Install runtime deps** (inside the repo root):
    ```bash
    cd CLIENT
+   pip install -r requirements.txt
+   ```
+
+2. **Webcam stream (default source 0):**
+   ```bash
    python detection_runner.py
    ```
-3. Here is a link to test videos:
-    https://www.dropbox.com/scl/fo/1bwsmg8a882nqemau9wro/AEEeT9scdAgfX0rBOnd3TB4?rlkey=klhgmtioxg5sw432w0qtkju34&st=c422vn85&dl=0
+   - Press `q` to exit.
+
+3. **Analyze a specific video file:**
+   ```bash
+   python detection_runner.py --video "path/to/video.mp4"
+   ```
+
+4. **Save the annotated output:**
+   ```bash
+   python detection_runner.py --source 0 --output "output.mp4"
+   # or for a file
+   python detection_runner.py --video "path/to/video.mp4" --output "output.mp4"
+   ```
+
+5. **Tune performance:** use `--frame-skip N` to process every Nth frame (default 1).
+
+6. Test videos are available here:
+   https://www.dropbox.com/scl/fo/1bwsmg8a882nqemau9wro/AEEeT9scdAgfX0rBOnd3TB4?rlkey=klhgmtioxg5sw432w0qtkju34&st=c422vn85&dl=0
 
 
 ## Key Features

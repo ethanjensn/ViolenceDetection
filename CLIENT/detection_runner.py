@@ -1,6 +1,9 @@
 # Simple video processor using your trained violence detection model
+import argparse
 import cv2
 import numpy as np
+import os
+from pathlib import Path
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -10,10 +13,11 @@ import timm
 import time
 
 # Configuration
-VIDEO_PATH = r"<INSERT VIDEO PATH HERE>"
+VIDEO_PATH = None
 FRAME_SKIP = 1  # Process every Nth frame
-YOLO_MODEL_PATH = '<INSERT YOLO MODEL PATH HERE>'
-VIOLENCE_MODEL_PATH = '<INSERT VIOLENCE DETECTION MODEL PATH HERE>'
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+YOLO_MODEL_PATH = str(_PROJECT_ROOT / 'MODELS' / 'yolo11m-pose.pt')
+VIOLENCE_MODEL_PATH = str(_PROJECT_ROOT / 'MODELS' / 'violence_model.pt')
 
 # Global models
 detection_model = None
@@ -285,6 +289,86 @@ def process_video():
     print(f"Total alert duration: {total_alert_duration:.2f} seconds")
     print(f"Output video saved to: {output_video_path}")
 
+def process_realtime(source, output_video_path=None, display=True):
+    global total_alerts, total_alert_duration
+
+    if isinstance(source, int):
+        cap = cv2.VideoCapture(source)
+    else:
+        cap = cv2.VideoCapture(source)
+
+    if not cap.isOpened():
+        print(f"Error: Could not open source {source}")
+        return
+
+    fps_in = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if not fps_in or fps_in <= 0 or np.isnan(fps_in):
+        fps_in = 30.0
+
+    out = None
+    if output_video_path:
+        output_video_path = str(output_video_path)
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_video_path, fourcc, fps_in, (width, height))
+
+    frame_count = 0
+    last_t = time.time()
+    ema_fps = None
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_count % FRAME_SKIP != 0:
+                frame_count += 1
+                continue
+
+            frame_result = process_frame(frame, frame_count)
+            annotated_frame = create_annotated_frame(frame, frame_result)
+
+            now = time.time()
+            dt = now - last_t
+            last_t = now
+            inst_fps = 1.0 / dt if dt > 0 else 0.0
+            ema_fps = inst_fps if ema_fps is None else (0.9 * ema_fps + 0.1 * inst_fps)
+
+            cv2.putText(
+                annotated_frame,
+                f"FPS: {ema_fps:.1f}",
+                (20, 170),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+            )
+
+            if out is not None:
+                out.write(annotated_frame)
+
+            if display:
+                cv2.imshow('Violence Detection (Local)', annotated_frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+
+            frame_count += 1
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if current_alert_start is not None:
+            total_alert_duration += time.time() - current_alert_start
+
+        cap.release()
+        if out is not None:
+            out.release()
+        if display:
+            cv2.destroyAllWindows()
+
 def process_frame(frame, frame_number):
     """Process a single frame and return results"""
     
@@ -460,13 +544,44 @@ def create_annotated_frame(frame, frame_result):
     return annotated_frame
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--source', type=str, default='0')
+    parser.add_argument('--video', type=str, default=None)
+    parser.add_argument('--frame-skip', type=int, default=1)
+    parser.add_argument('--yolo-model', type=str, default=YOLO_MODEL_PATH)
+    parser.add_argument('--violence-model', type=str, default=VIOLENCE_MODEL_PATH)
+    parser.add_argument('--output', type=str, default=None)
+    parser.add_argument('--no-display', action='store_true')
+    args = parser.parse_args()
+
+    if args.video:
+        source = args.video
+    else:
+        source = int(args.source) if str(args.source).isdigit() else args.source
+
+    FRAME_SKIP = max(1, int(args.frame_skip))
+    YOLO_MODEL_PATH = args.yolo_model
+    VIOLENCE_MODEL_PATH = args.violence_model
+    VIDEO_PATH = args.video
+
+    if not os.path.exists(YOLO_MODEL_PATH):
+        raise FileNotFoundError(f"YOLO model not found at: {YOLO_MODEL_PATH}")
+    if not os.path.exists(VIOLENCE_MODEL_PATH):
+        raise FileNotFoundError(f"Violence model not found at: {VIOLENCE_MODEL_PATH}")
+
     print("=== Simple Violence Detection Processor ===")
-    print(f"Video: {VIDEO_PATH}")
+    print(f"Source: {source}")
     print(f"Frame skip: {FRAME_SKIP}")
+    print(f"YOLO: {YOLO_MODEL_PATH}")
+    print(f"Violence model: {VIOLENCE_MODEL_PATH}")
     print("=" * 50)
-    
-    # Load models first
+
     load_models()
-    
-    # Process video
-    process_video()
+
+    if args.video and args.output is None and not args.no_display:
+        process_realtime(source=args.video, output_video_path=None, display=True)
+    elif args.video and args.output is None and args.no_display:
+        VIDEO_PATH = args.video
+        process_video()
+    else:
+        process_realtime(source=source, output_video_path=args.output, display=(not args.no_display))
