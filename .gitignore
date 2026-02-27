@@ -1,3 +1,6 @@
+# Ignore all model files except best_violence_rgb_pose_v2.pt
+MODELS/*.pt
+!MODELS/best_violence_rgb_pose_v2.pt
 # Use relative paths from where this .gitignore file sits
 testing_files/
 TRAINING/training_datasets/
@@ -5,4 +8,21 @@ TRAINING/dataset_b4_deleting_videos/
 venv/
 *.avi
 *.zip
+TRAINING/yolo11l-pose.pt
+TRAINING/yolo11m-pose.pt
+TRAINING/yolo11x-pose.pt
 TRAINING/pose_cache_lstm/
+TRAINING/caches/
+TRAINING/runs/
+TRAINING/training_datasets_V2/*
+TRAINING/training_datasets_V3/*
+TRAINING/training_datasets_V4-V3andV2-Combined/*
+TRAINING/new_datasets/*
+# Replace the last three lines with these:
+# (Leave everything else in the file as is)
+MODELS/*.pt
+!MODELS/best_violence_rgb_pose_v2.pt
+!MODELS/inference_threshold.txt
+!MODELS/tta_enabled.txt
+TRAINING/*.pt
+MODELS/old_models/

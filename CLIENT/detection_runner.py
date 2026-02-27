@@ -18,7 +18,7 @@ VIDEO_PATH = None
 FRAME_SKIP = 1  # Process every Nth frame
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 YOLO_MODEL_PATH = str(_PROJECT_ROOT / 'MODELS' / 'yolo11m-pose.pt')
-VIOLENCE_MODEL_PATH = str(_PROJECT_ROOT / 'MODELS' / 'best_violence_lstm.pt')
+VIOLENCE_MODEL_PATH = str(_PROJECT_ROOT / 'MODELS' / 'best_violence_rgb_pose_v2.pt')
 
 # Global models
 detection_model = None
@@ -27,17 +27,41 @@ violence_model_type = None
 device = None
 transform = None
 sequence_buffer = None
+runtime_lstm_input_size = None
+runtime_k_people = None
+rgb_frame_buffer = None      # rolling RGB frame buffer for RGBPoseFusionV2
+rgb_pose_transform = None   # 112x112 transform for RGBPoseFusionV2
 
-SEQUENCE_LENGTH = 30
+SEQUENCE_LENGTH = 20
 K_PEOPLE = 2
 NUM_KEYPOINTS = 17
 FEATURES_PER_PERSON = NUM_KEYPOINTS * 3
 LSTM_INPUT_SIZE = K_PEOPLE * FEATURES_PER_PERSON
 
+# RGBPoseFusionV2 constants (must match training config)
+RGB_FRAMES_FUSION = 5
+RGB_SIZE_FUSION = 112
+POSE_INPUT_SIZE_FUSION = K_PEOPLE * FEATURES_PER_PERSON  # 102
+LSTM_HIDDEN_FUSION = 512
+
+# Load inference threshold written by training script after threshold sweep.
+# Falls back to 0.5 if file not found (e.g. before first training run).
+_THRESHOLD_PATH = _PROJECT_ROOT / 'MODELS' / 'inference_threshold.txt'
+try:
+    INFERENCE_THRESHOLD = float(_THRESHOLD_PATH.read_text().strip())
+except (FileNotFoundError, ValueError):
+    INFERENCE_THRESHOLD = 0.5
+
+# Temporal smoothing — averages raw scores over a rolling window before comparing
+# to threshold. This suppresses single-frame spikes that cause false red flashes.
+# Increase SMOOTHING_WINDOW to be less reactive, decrease to be more reactive.
+SMOOTHING_WINDOW = 8
+_score_history = deque(maxlen=SMOOTHING_WINDOW)
+
 # Alert tracking
 alert_start_time = None
-alert_threshold = 0.8
-alert_duration_threshold = 0.5  # 0.5 seconds
+alert_threshold = INFERENCE_THRESHOLD  # driven by training sweep, not hardcoded
+alert_duration_threshold = 0.5
 total_alerts = 0
 total_alert_duration = 0.0
 current_alert_start = None
@@ -149,6 +173,82 @@ class PoseLSTM(nn.Module):
         out = self.classifier(context)
         return out
 
+# =============================================================================
+# RGBPoseFusionV2 — must match architecture in train_rgb_pose.py exactly
+# =============================================================================
+
+class RGBPoseFusionV2(nn.Module):
+    """
+    Two-stream fusion model trained by train_rgb_pose.py.
+    Stream A: PoseLSTM (hidden_size=512) on 20-frame skeleton sequence.
+    Stream B: MobileNetV3-Small on RGB_FRAMES_FUSION evenly-spaced frames.
+    """
+    def __init__(self,
+                 pose_input_size=POSE_INPUT_SIZE_FUSION,
+                 lstm_hidden=LSTM_HIDDEN_FUSION):
+        super().__init__()
+        from torchvision import models as _models
+
+        # Stream A — Pose LSTM
+        self.pose_embedding = nn.Sequential(
+            nn.Linear(pose_input_size, lstm_hidden),
+            nn.LayerNorm(lstm_hidden),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        self.lstm = nn.LSTM(lstm_hidden, lstm_hidden, num_layers=2,
+                            batch_first=True, dropout=0.3)
+        self.pose_attention = nn.Linear(lstm_hidden, 1)
+        self.pose_proj = nn.Sequential(
+            nn.Linear(lstm_hidden, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+
+        # Stream B — MobileNetV3-Small
+        mobilenet = _models.mobilenet_v3_small(
+            weights=_models.MobileNet_V3_Small_Weights.DEFAULT
+        )
+        self.rgb_backbone = mobilenet.features
+        self.rgb_pool = nn.AdaptiveAvgPool2d(1)
+        self.rgb_proj = nn.Sequential(
+            nn.Linear(576, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+
+        # Fusion classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(128 + 128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, pose_seq, rgb_frames):
+        """
+        pose_seq:   (B, SEQUENCE_LENGTH, POSE_INPUT_SIZE_FUSION)
+        rgb_frames: (B, RGB_FRAMES_FUSION, 3, RGB_SIZE_FUSION, RGB_SIZE_FUSION)
+        """
+        # Pose stream
+        x = self.pose_embedding(pose_seq)
+        lstm_out, _ = self.lstm(x)
+        attn = F.softmax(self.pose_attention(lstm_out), dim=1)
+        pose_ctx = torch.sum(attn * lstm_out, dim=1)
+        pose_emb = self.pose_proj(pose_ctx)
+
+        # RGB stream
+        B, T, C, H, W = rgb_frames.shape
+        frames_flat = rgb_frames.view(B * T, C, H, W)
+        feat = self.rgb_backbone(frames_flat)
+        feat = self.rgb_pool(feat).flatten(1)
+        feat = feat.view(B, T, -1).mean(dim=1)
+        rgb_emb = self.rgb_proj(feat)
+
+        fused = torch.cat([pose_emb, rgb_emb], dim=1)
+        return self.classifier(fused)
+
+
 def _safe_torch_load(path, device):
     try:
         return torch.load(path, map_location=device, weights_only=True)
@@ -165,15 +265,43 @@ def _detect_model_type(state_dict: dict) -> str:
         return 'unknown'
 
     keys = set(state_dict.keys())
+    # RGBPoseFusionV2 has pose_embedding + rgb_backbone keys
+    if any(k.startswith('pose_embedding.') for k in keys) and any(k.startswith('rgb_backbone.') for k in keys):
+        return 'rgb_pose_fusion'
     if any(k.startswith('embedding.') for k in keys) or any(k.startswith('lstm.') for k in keys):
         return 'lstm'
     if any(k.startswith('pose_encoder.') for k in keys) or any(k.startswith('backbone.') for k in keys):
         return 'enhanced'
     return 'unknown'
 
+def _infer_lstm_hparams(state_dict: dict) -> tuple[int, int, int]:
+    """Infer (input_size, hidden_size, num_layers) from a PoseLSTM state_dict."""
+    input_size = LSTM_INPUT_SIZE
+    hidden_size = 128
+    num_layers = 2
+
+    emb_w = state_dict.get('embedding.0.weight')
+    if hasattr(emb_w, 'shape') and len(emb_w.shape) == 2:
+        hidden_size = int(emb_w.shape[0])
+        input_size = int(emb_w.shape[1])
+
+    layer_indices = []
+    for k in state_dict.keys():
+        if k.startswith('lstm.weight_ih_l'):
+            try:
+                idx = int(k.split('lstm.weight_ih_l', 1)[1])
+                layer_indices.append(idx)
+            except Exception:
+                pass
+    if layer_indices:
+        num_layers = int(max(layer_indices) + 1)
+
+    return input_size, hidden_size, num_layers
+
 def load_models():
     """Load YOLO and violence detection models"""
-    global detection_model, violence_model, violence_model_type, device, transform, sequence_buffer
+    global detection_model, violence_model, violence_model_type, device, transform, sequence_buffer, \
+        runtime_lstm_input_size, runtime_k_people, rgb_frame_buffer, rgb_pose_transform
     
     print("[INFO] Loading models...")
     
@@ -191,14 +319,57 @@ def load_models():
     state_dict = _get_state_dict(checkpoint)
     violence_model_type = _detect_model_type(state_dict)
 
-    if violence_model_type == 'lstm':
-        violence_model = PoseLSTM().to(device)
+    if violence_model_type == 'rgb_pose_fusion':
+        print("[INFO] Detected RGBPoseFusionV2 model architecture")
+        violence_model = RGBPoseFusionV2().to(device)
         violence_model.load_state_dict(state_dict)
-        sequence_buffer = deque([torch.zeros(LSTM_INPUT_SIZE, dtype=torch.float32) for _ in range(SEQUENCE_LENGTH)], maxlen=SEQUENCE_LENGTH)
+        runtime_lstm_input_size = POSE_INPUT_SIZE_FUSION
+        runtime_k_people = K_PEOPLE
+        # Rolling pose sequence buffer (20 frames of skeleton data)
+        sequence_buffer = deque(
+            [torch.zeros(POSE_INPUT_SIZE_FUSION, dtype=torch.float32) for _ in range(SEQUENCE_LENGTH)],
+            maxlen=SEQUENCE_LENGTH,
+        )
+        # Rolling RGB frame buffer (5 frames of 112x112 images)
+        rgb_frame_buffer = deque(
+            [torch.zeros(3, RGB_SIZE_FUSION, RGB_SIZE_FUSION, dtype=torch.float32)
+             for _ in range(RGB_FRAMES_FUSION)],
+            maxlen=RGB_FRAMES_FUSION,
+        )
+        rgb_pose_transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((RGB_SIZE_FUSION, RGB_SIZE_FUSION)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    elif violence_model_type == 'lstm':
+        inferred_input_size, inferred_hidden_size, inferred_num_layers = _infer_lstm_hparams(state_dict)
+        runtime_lstm_input_size = int(inferred_input_size)
+        if FEATURES_PER_PERSON > 0 and runtime_lstm_input_size % FEATURES_PER_PERSON == 0:
+            runtime_k_people = int(runtime_lstm_input_size // FEATURES_PER_PERSON)
+        else:
+            runtime_k_people = None
+        violence_model = PoseLSTM(
+            input_size=inferred_input_size,
+            hidden_size=inferred_hidden_size,
+            num_layers=inferred_num_layers,
+            num_classes=1,
+        ).to(device)
+        violence_model.load_state_dict(state_dict)
+        sequence_buffer = deque(
+            [torch.zeros(inferred_input_size, dtype=torch.float32) for _ in range(SEQUENCE_LENGTH)],
+            maxlen=SEQUENCE_LENGTH,
+        )
+        rgb_frame_buffer = None
+        rgb_pose_transform = None
     else:
         violence_model = EnhancedViolenceClassifier(pose_feature_dim=325, use_pretrained=True).to(device)
         violence_model.load_state_dict(state_dict)
         sequence_buffer = None
+        runtime_lstm_input_size = None
+        runtime_k_people = None
+        rgb_frame_buffer = None
+        rgb_pose_transform = None
         
     violence_model.eval()
     print(f"[INFO] Violence detection model loaded on {device}")
@@ -214,18 +385,21 @@ def load_models():
     print("[INFO] All models loaded successfully!")
 
 def extract_lstm_frame_features(results):
+    target_input_size = runtime_lstm_input_size if runtime_lstm_input_size is not None else LSTM_INPUT_SIZE
+    k_people = runtime_k_people if runtime_k_people is not None else K_PEOPLE
+
     if not results or len(results) == 0 or results[0].keypoints is None:
-        return torch.zeros(LSTM_INPUT_SIZE, dtype=torch.float32)
+        return torch.zeros(target_input_size, dtype=torch.float32)
 
     r0 = results[0]
 
     try:
         kps = r0.keypoints.xyn
         if kps is None:
-            return torch.zeros(LSTM_INPUT_SIZE, dtype=torch.float32)
+            return torch.zeros(target_input_size, dtype=torch.float32)
         kps = kps.cpu().numpy()
     except Exception:
-        return torch.zeros(LSTM_INPUT_SIZE, dtype=torch.float32)
+        return torch.zeros(target_input_size, dtype=torch.float32)
 
     try:
         kp_conf = r0.keypoints.conf.cpu().numpy()
@@ -239,7 +413,7 @@ def extract_lstm_frame_features(results):
 
     n = len(kps)
     if n <= 0:
-        return torch.zeros(LSTM_INPUT_SIZE, dtype=torch.float32)
+        return torch.zeros(target_input_size, dtype=torch.float32)
 
     if det_conf is None or len(det_conf) != n:
         order = np.arange(n)
@@ -247,7 +421,7 @@ def extract_lstm_frame_features(results):
         order = np.argsort(det_conf)[::-1]
 
     frame_features = []
-    for k in range(K_PEOPLE):
+    for k in range(k_people):
         if k < len(order):
             i = int(order[k])
             xy = kps[i]
@@ -272,11 +446,11 @@ def extract_lstm_frame_features(results):
             person = [0.0] * FEATURES_PER_PERSON
         frame_features.extend(person)
 
-    if len(frame_features) != LSTM_INPUT_SIZE:
-        if len(frame_features) < LSTM_INPUT_SIZE:
-            frame_features.extend([0.0] * (LSTM_INPUT_SIZE - len(frame_features)))
+    if len(frame_features) != target_input_size:
+        if len(frame_features) < target_input_size:
+            frame_features.extend([0.0] * (target_input_size - len(frame_features)))
         else:
-            frame_features = frame_features[:LSTM_INPUT_SIZE]
+            frame_features = frame_features[:target_input_size]
 
     return torch.tensor(frame_features, dtype=torch.float32)
 
@@ -522,16 +696,32 @@ def process_frame(frame, frame_number):
         
         # 4. Get violence prediction
         with torch.no_grad():
-            if violence_model_type == 'lstm':
+            if violence_model_type == 'rgb_pose_fusion':
+                # Update pose sequence buffer
+                frame_feat = extract_lstm_frame_features(results)
+                sequence_buffer.append(frame_feat)
+                pose_seq = torch.stack(list(sequence_buffer), dim=0).unsqueeze(0).to(device)
+                # Update rolling RGB buffer with current frame (112x112)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb_tensor = rgb_pose_transform(frame_rgb)
+                rgb_frame_buffer.append(rgb_tensor)
+                rgb_seq = torch.stack(list(rgb_frame_buffer), dim=0).unsqueeze(0).to(device)
+                violence_logit = violence_model(pose_seq, rgb_seq)
+                raw_score = float(torch.sigmoid(violence_logit)[0][0])
+            elif violence_model_type == 'lstm':
                 frame_feat = extract_lstm_frame_features(results)
                 sequence_buffer.append(frame_feat)
                 seq = torch.stack(list(sequence_buffer), dim=0).unsqueeze(0).to(device)
                 violence_logit = violence_model(seq)
-                violence_score = float(torch.sigmoid(violence_logit)[0][0])
+                raw_score = float(torch.sigmoid(violence_logit)[0][0])
             else:
                 violence_pred = violence_model(pose_features, image_tensor)
                 violence_probs = torch.softmax(violence_pred, dim=1)
-                violence_score = float(violence_probs[0][1])
+                raw_score = float(violence_probs[0][1])
+
+        # Temporal smoothing: average over recent frames to suppress single-frame spikes
+        _score_history.append(raw_score)
+        violence_score = float(np.mean(_score_history))
         
         # 5. Extract detection data
         detected_poses_data = []
@@ -603,11 +793,12 @@ def create_annotated_frame(frame, frame_result):
     cv2.putText(annotated_frame, f"Frame: {frame_num}", (20, 30), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     
-    # Display violence score with color coding
-    if violence_score < 0.4:
+    # Display violence score with color coding — thresholds scale with INFERENCE_THRESHOLD
+    low_cutoff = INFERENCE_THRESHOLD * 0.6
+    if violence_score < low_cutoff:
         score_color = (0, 255, 0)  # Green - Low risk
         risk_level = "LOW"
-    elif violence_score < 0.7:
+    elif violence_score < INFERENCE_THRESHOLD:
         score_color = (0, 165, 255)  # Orange - Medium risk
         risk_level = "MEDIUM"
     else:
@@ -616,6 +807,20 @@ def create_annotated_frame(frame, frame_result):
     
     cv2.putText(annotated_frame, f"Violence Score: {violence_score:.3f} ({risk_level})", 
                 (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, score_color, 2)
+
+    threshold_text = f"Threshold: {INFERENCE_THRESHOLD:.2f} | Window: {SMOOTHING_WINDOW}f"
+    (text_width, text_height), _ = cv2.getTextSize(threshold_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    x_pos = annotated_frame.shape[1] - text_width - 20
+    y_pos = 30
+    cv2.putText(
+        annotated_frame,
+        threshold_text,
+        (x_pos, y_pos),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (200, 200, 200),
+        1,
+    )
     
     # Alert system
     current_time = time.time()
@@ -662,9 +867,10 @@ def create_annotated_frame(frame, frame_result):
         x1, y1, x2, y2 = bbox
         
         # Use violence score to color boxes
-        if violence_score < 0.4:
+        low_cutoff = INFERENCE_THRESHOLD * 0.6
+        if violence_score < low_cutoff:
             box_color = (0, 255, 0)  # Green
-        elif violence_score < 0.7:
+        elif violence_score < INFERENCE_THRESHOLD:
             box_color = (0, 165, 255)  # Orange
         else:
             box_color = (0, 0, 255)  # Red
@@ -719,6 +925,7 @@ if __name__ == "__main__":
     print(f"Frame skip: {FRAME_SKIP}")
     print(f"YOLO: {YOLO_MODEL_PATH}")
     print(f"Violence model: {VIOLENCE_MODEL_PATH}")
+    print(f"Inference threshold: {INFERENCE_THRESHOLD:.4f}  (smoothing window: {SMOOTHING_WINDOW} frames)")
     print("=" * 50)
 
     load_models()
