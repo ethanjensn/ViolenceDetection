@@ -1,19 +1,33 @@
 # Violence Detection
 
-<div style="display:flex; gap:16px; justify-content:space-between; flex-wrap:nowrap;">
-  <figure style="flex:1; text-align:center;">
-    <video controls src="asset_videos/Bike_Edited.mp4" title="Bike Alert" style="width:100%;"></video>
-    <figcaption><strong>Fight Detection</strong></figcaption>
-  </figure>
-  <figure style="flex:1; text-align:center;">
-    <video controls src="asset_videos/fightone_edited.mp4" title="Fight Detection" style="width:100%;"></video>
-    <figcaption><strong>Fight Detection</strong></figcaption>
-  </figure>
-  <figure style="flex:1; text-align:center;">
-    <video controls src="asset_videos/Non_Violence.mp4" title="Non-violent Scene" style="width:100%;"></video>
-    <figcaption><strong>Non-violent Scene</strong></figcaption>
-  </figure>
-</div>
+<table>
+  <thead>
+    <tr>
+      <th>Fight Detection</th>
+      <th>Fight Detection</th>
+      <th>Non-violent Scene</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>
+        <video controls autoplay muted loop playsinline
+               src="https://github.com/user-attachments/assets/11671d14-5f63-44a0-9491-071c9a82d811"
+               style="width:100%; max-width:320px;"></video>
+      </td>
+      <td>
+        <video controls autoplay muted loop playsinline
+               src="https://github.com/user-attachments/assets/d8e95cc2-35f1-4e4e-8012-dc10e8d77c96"
+               style="width:100%; max-width:320px;"></video>
+      </td>
+      <td>
+        <video controls autoplay muted loop playsinline
+               src="https://github.com/user-attachments/assets/cf662126-b0cd-4ea5-ab15-2005e34a2e66"
+               style="width:100%; max-width:320px;"></video>
+      </td>
+    </tr>
+  </tbody>
+</table>
 
 A deep learning-based system for detecting violent behavior in video streams using pose estimation and computer vision techniques.
 
