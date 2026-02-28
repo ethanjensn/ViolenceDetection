@@ -1,4 +1,19 @@
-# Violence Detection V2
+# Violence Detection
+
+<div style="display:flex; gap:16px; justify-content:space-between; flex-wrap:nowrap;">
+  <figure style="flex:1; text-align:center;">
+    <video controls src="asset_videos/Bike_Edited.mp4" title="Bike Alert" style="width:100%;"></video>
+    <figcaption><strong>Fight Detection</strong></figcaption>
+  </figure>
+  <figure style="flex:1; text-align:center;">
+    <video controls src="asset_videos/fightone_edited.mp4" title="Fight Detection" style="width:100%;"></video>
+    <figcaption><strong>Fight Detection</strong></figcaption>
+  </figure>
+  <figure style="flex:1; text-align:center;">
+    <video controls src="asset_videos/Non_Violence.mp4" title="Non-violent Scene" style="width:100%;"></video>
+    <figcaption><strong>Non-violent Scene</strong></figcaption>
+  </figure>
+</div>
 
 A deep learning-based system for detecting violent behavior in video streams using pose estimation and computer vision techniques.
 
@@ -12,19 +27,20 @@ This project implements a real-time violence detection system that combines:
 ## Project Structure
 
 ```
-Violence Detection V2/
+Violence Detection/
 ├── CLIENT/                          # Runtime detection system
-│   ├── detection_runner.py         # Main video processing script
+│   ├── detection_runner.py         # Main video processing script / runner
 │   └── requirements.txt            # Runtime dependencies
+├── asset_videos/                    # Embedded demo clips referenced in README
+│   ├── Bike_Edited.mp4
+│   ├── fightone_edited.mp4
+│   └── Non_Violence.mp4
 ├── MODELS/                          # Pre-trained models
 │   ├── violence_model.pt           # Trained violence classifier
 │   └── yolo11m-pose.pt            # YOLO pose estimation model
 ├── TRAINING/                        # Model training scripts
-│   ├── train_violence_detection.py # Training pipeline
+│   ├── train_rgb_pose.py           # RGB + pose fusion training pipeline
 │   └── requirements.txt            # Training dependencies
-└── testing_files/                   # Test videos and validation data
-    ├── crowd*.mp4                  # Crowd scene test videos
-    └── validation/                 # Fight scene validation videos
 ```
 
 ## Quick Start
@@ -110,8 +126,29 @@ pip install torch>=2.0.0 torchvision>=0.15.0 opencv-python>=4.8.0 numpy>=1.24.0 
 
 5. **Tune performance:** use `--frame-skip N` to process every Nth frame (default 1).
 
-6. Test videos are available here:
-   https://www.dropbox.com/scl/fo/1bwsmg8a882nqemau9wro/AEEeT9scdAgfX0rBOnd3TB4?rlkey=klhgmtioxg5sw432w0qtkju34&st=c422vn85&dl=0
+### Detection Runner Details (CLIENT/detection_runner.py)
+
+`detection_runner.py` is the single entry point for realtime inference. It:
+
+- Loads the YOLO11M-Pose backbone and the fusion classifier from `MODELS/`
+- Accepts webcam (`--source`), file (`--video`) or RTSP (`--url`) inputs
+- Exposes CLI flags for frame skipping, output recording, alert thresholds, and probability smoothing
+- Streams annotated frames while tracking alert state transitions and emitting console stats
+
+Common runner flags:
+
+```bash
+# Custom camera index and frame skipping
+python detection_runner.py --source 1 --frame-skip 2
+
+# Override alert sensitivity
+python detection_runner.py --alert-threshold 0.75 --alert-duration 0.3
+
+# Read from RTSP and record output
+python detection_runner.py --url "rtsp://<camera>" --output recorded.mp4
+```
+
+All arguments are optional; defaults target a standard webcam feed with conservative alerting. Review `CLIENT/detection_runner.py` for additional toggles (smoothing window, max people tracked, visualization colors, etc.).
 
 
 ## Key Features
@@ -123,30 +160,21 @@ pip install torch>=2.0.0 torchvision>=0.15.0 opencv-python>=4.8.0 numpy>=1.24.0 
 - **Advanced alert system** with duration tracking and statistics
 
 ### Alert System
-The system implements a sophisticated multi-level alert mechanism:
+The real-time runner now mirrors the production logic implemented in `CLIENT/detection_runner.py`:
 
-#### **Alert Triggers**
-- **Violence Score Threshold**: Default 0.8 (80% confidence)
-- **Duration Threshold**: Default 0.5 seconds (minimum sustained violence)
-- **Real-time Monitoring**: Continuous frame-by-frame analysis
+- **Adaptive thresholding**: `alert_threshold` defaults to the value stored in `MODELS/inference_threshold.txt`, which is produced by the training threshold sweep. If the file is absent, it falls back to `0.5`.
+- **Temporal smoothing**: A rolling window (`SMOOTHING_WINDOW = 8`) averages logits before comparing them to the alert threshold to suppress single-frame spikes.
+- **Duration gating**: An alert is only declared if the smoothed score remains above `alert_threshold` for `alert_duration_threshold` seconds (default `0.5`).
+- **Statistics**: The runner tracks `total_alerts`, cumulative `total_alert_duration`, and surfaces “Alert in …” countdowns while the timer is arming.
+- **States on HUD**: When the score is below threshold the overlay shows “No alerts yet.” Above threshold it displays either a countdown or an “ALERT” banner once the dwell time is satisfied.
 
-#### **Alert States**
-1. **No Alert** (Green): Violence score < 0.4
-2. **Warning** (Orange): Violence score 0.4-0.7
-3. **Alert Pending** (Orange): Score ≥ 0.8, counting down to trigger
-4. **ALERT ACTIVE** (Red): Score ≥ 0.8 for ≥ 0.5 seconds
+To tweak behavior at runtime use flags such as:
 
-#### **Alert Logic**
-- **Activation**: Violence score must remain above threshold for specified duration
-- **Deactivation**: Automatically resets when score drops below threshold
-- **Statistics Tracking**: Counts total alerts and cumulative alert duration
-- **Visual Feedback**: Color-coded bounding boxes and on-screen alerts
-
-#### **Configuration Options**
-```python
-alert_threshold = 0.8              # Violence probability to trigger alert
-alert_duration_threshold = 0.5     # Seconds above threshold to activate
+```bash
+python detection_runner.py --alert-threshold 0.7 --alert-duration 0.3 --frame-skip 2
 ```
+
+Internally, the runner exposes additional knobs (`SMOOTHING_WINDOW`, webcam source, RTSP URL) so power users can tailor responsiveness to their deployment scenario.
 
 ### Model Architecture
 - **EnhancedViolenceClassifier**: Combines pose features with image analysis
@@ -167,12 +195,6 @@ The system processes video frames and outputs:
 - **Alert tracking** with configurable thresholds
 - **Real-time statistics** including total alerts and duration
 - **Visual overlays** on processed video frames
-
-## Test Videos
-
-- **Crowd scenes**: 8 test videos for general crowd behavior analysis
-- **Validation set**: 60+ fight scene videos for model evaluation
-- **Real-world scenarios**: Various lighting and crowd density conditions
 
 ## Configuration
 
@@ -202,10 +224,44 @@ The system processes video frames and outputs:
 2. Ensure pose features are pre-computed and cached
 3. Configure data augmentation parameters
 
-### Training Command
+### Training Pipelines
+
+#### `train_rgb_pose.py`
+
+The production trainer (`TRAINING/train_rgb_pose.py`) builds the exact RGBPoseFusionV2 weights consumed by the runner. Highlights:
+
+1. **Caching + preprocessing**
+   - `precompute_dataset()` runs YOLO11M-Pose over every clip to store skeleton tensors in `TRAINING/caches/pose_cache_lstm_seq20_k2_v2/` and RGB crops in `TRAINING/caches/rgb_cache_5frames_size112_v2/`.
+   - Sampling grabs 20 evenly spaced pose frames per video and 5 RGB frames (10–90% span) resized to 112×112.
+
+2. **Model + optimizer schedule**
+   - Dual-stream architecture: Pose LSTM (hidden 512, 2 layers + attention) fused with MobileNetV3-Small embeddings.
+   - Phase 1 (epochs 0–9): MobileNet stays frozen; only pose/fusion heads train with AdamW (`lr=1e-3`).
+   - Phase 2 (epoch 10+): Last three MobileNet blocks unfreeze; optimizer adds a low `1e-4` LR group for backbone fine-tuning.
+   - Mixed precision via `torch.amp.GradScaler` and ReduceLROnPlateau scheduler.
+
+3. **Losses + sampling**
+   - WeightedRandomSampler balances violence/non-violence clips.
+   - Custom `FocalLoss(alpha=0.75, gamma=2)` combats class imbalance.
+
+4. **Validation + artifacts**
+   - After each epoch, validation metrics (precision/recall/F1, FP rate) are logged to TensorBoard.
+   - Best F1 checkpoint saved to `MODELS/best_violence_rgb_pose_v2.pt`.
+   - Post-training, a 3-pass TTA evaluation (normal, flip, noise) runs a threshold sweep (0.30–0.84) capped at 20% FP rate. The chosen threshold is written to `MODELS/inference_threshold.txt` and a `MODELS/tta_enabled.txt` flag is set so the runner knows TTA-calibrated weights are in use.
+
+Before training, update the constants at the top of the script (`DATASET_PATH`, cache dirs, batch size) to match your environment, then run:
+
 ```bash
 cd TRAINING
-python train_violence_detection.py
+python train_rgb_pose.py
+```
+
+Expected dataset layout:
+
+```
+training_datasets/
+├── violence/
+└── non_violence/
 ```
 
 ## Usage Examples

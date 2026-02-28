@@ -26,3 +26,4 @@ MODELS/*.pt
 !MODELS/tta_enabled.txt
 TRAINING/*.pt
 MODELS/old_models/
+videos_for_readme/
